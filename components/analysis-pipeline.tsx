@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useMemo } from 'react'
+import { useEffect, useState, useMemo, useRef } from 'react'
 import { motion } from 'motion/react'
 import {
   UploadCloud,
@@ -17,11 +17,16 @@ import {
   BarChart3,
   FileText,
   Zap,
+  AlertCircle,
 } from 'lucide-react'
 import { AiCore } from '@/components/ai-core'
+import { useEventStream } from '@/lib/hooks/useEventStream'
+import { startAnalysis, uploadFile } from '@/lib/api/services/analysis'
+import { getAnalysisRoute } from '@/lib/modality-routing'
+import type { AnalysisStatusResponse } from '@/lib/types/api'
 
 /**
- * V2 — 12-Stage AI Analysis Pipeline with Live Thinking Panel.
+ * V2 — 12-Stage AI Analysis Pipeline with Live Thinking Panel + Real API Integration.
  *
  * Extended from 7 → 12 stages. Features:
  *  - AI Core visualization at top
@@ -30,27 +35,24 @@ import { AiCore } from '@/components/ai-core'
  *  - Live AI Thinking panel with layer progression + confidence counter
  *  - Enhanced progress bar with glow trail
  *  - Pulse ring emission on step completion
+ *  - Real-time event stream updates from backend
+ *  - Fallback to mock mode if backend unavailable
  */
 
 const steps = [
-  { label: 'Uploading Scan', icon: UploadCloud },
-  { label: 'Medical Image Validation', icon: ShieldCheck },
-  { label: 'Modality Detection', icon: ScanEye },
-  { label: 'Image Preprocessing', icon: Wand2 },
-  { label: 'Feature Extraction', icon: Layers3 },
-  { label: 'Deep CNN Analysis', icon: BrainCircuit },
-  { label: 'Grad-CAM Explainability', icon: Waves },
-  { label: 'Clinical Pattern Matching', icon: Cpu },
-  { label: 'Confidence Calibration', icon: BarChart3 },
-  { label: 'Generating Findings', icon: FileScan },
-  { label: 'Building Report', icon: FileText },
-  { label: 'Analysis Complete', icon: CheckCircle2 },
+  { label: 'Uploading Scan', icon: UploadCloud, apiStatus: 'uploading' },
+  { label: 'Medical Image Validation', icon: ShieldCheck, apiStatus: 'preprocessing' },
+  { label: 'Modality Detection', icon: ScanEye, apiStatus: 'preprocessing' },
+  { label: 'Image Preprocessing', icon: Wand2, apiStatus: 'preprocessing' },
+  { label: 'Feature Extraction', icon: Layers3, apiStatus: 'inference' },
+  { label: 'Deep CNN Analysis', icon: BrainCircuit, apiStatus: 'inference' },
+  { label: 'Grad-CAM Explainability', icon: Waves, apiStatus: 'gradcam' },
+  { label: 'Clinical Pattern Matching', icon: Cpu, apiStatus: 'analysis' },
+  { label: 'Confidence Calibration', icon: BarChart3, apiStatus: 'analysis' },
+  { label: 'Generating Findings', icon: FileScan, apiStatus: 'report' },
+  { label: 'Building Report', icon: FileText, apiStatus: 'report' },
+  { label: 'Analysis Complete', icon: CheckCircle2, apiStatus: 'complete' },
 ]
-
-const STEP_MS = 900
-
-// V2 — Confidence animation keyframes
-const confidenceStages = [0, 12, 24, 36, 48, 58, 67, 71, 78, 84, 89, 92, 95, 97, 99]
 
 // V2 — AI layer names for live thinking display
 const layerNames = [
@@ -68,34 +70,84 @@ const layerNames = [
   'Dense_2 (Softmax)',
 ]
 
+interface AnalysisPipelineProps {
+  fileName: string
+  file: File
+  onComplete: (results: any) => void
+  onError?: (error: Error) => void
+}
+
 export function AnalysisPipeline({
   fileName,
+  file,
   onComplete,
-}: {
-  fileName: string
-  onComplete: () => void
-}) {
-  const [active, setActive] = useState(0)
+  onError,
+}: AnalysisPipelineProps) {
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [isUploading, setIsUploading] = useState(true)
   const [confidence, setConfidence] = useState(0)
   const [currentLayer, setCurrentLayer] = useState(0)
+  const [error, setError] = useState<string | null>(null)
+  
+  const { status, results, error: streamError, isRunning, start: startStream } = useEventStream()
+  const analysisStartedRef = useRef(false)
 
+  // Map API status to UI step index
+  const mapStatusToStep = (apiStatus?: string): number => {
+    if (!apiStatus) return 0
+    const step = steps.findIndex((s) => s.apiStatus === apiStatus)
+    return step >= 0 ? step : 0
+  }
+
+  const active = status ? mapStatusToStep(status.status) : 0
+  const progress = status?.progress_percent ?? 0
+
+  // Start analysis on mount
   useEffect(() => {
-    if (active >= steps.length - 1) {
-      const done = setTimeout(onComplete, 1200)
-      return () => clearTimeout(done)
+    if (analysisStartedRef.current) return
+    analysisStartedRef.current = true
+
+    const runAnalysis = async () => {
+      try {
+        // Get routing info
+        const route = getAnalysisRoute(fileName)
+
+        // Upload file
+        setIsUploading(true)
+        const uploadResponse = await uploadFile(file, route.modelEndpoint)
+        setUploadProgress(100)
+        setIsUploading(false)
+
+        // Start analysis and get event stream
+        const { jobId, eventStream } = await startAnalysis(uploadResponse.file_id, route.modelEndpoint)
+        startStream(jobId)
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : 'Analysis failed'
+        setError(errorMsg)
+        onError?.(err instanceof Error ? err : new Error(errorMsg))
+      }
     }
-    const t = setTimeout(() => setActive((s) => s + 1), STEP_MS)
-    return () => clearTimeout(t)
-  }, [active, onComplete])
 
-  // V2 — Animate confidence
+    runAnalysis()
+  }, [fileName, file, onError, startStream])
+
+  // Handle stream completion
   useEffect(() => {
-    const confIdx = Math.min(
-      Math.floor((active / (steps.length - 1)) * confidenceStages.length),
-      confidenceStages.length - 1
-    )
-    const target = confidenceStages[confIdx]
-    // Smooth count to target
+    if (results) {
+      onComplete(results)
+    }
+  }, [results, onComplete])
+
+  // Handle stream errors
+  useEffect(() => {
+    if (streamError) {
+      setError(streamError.message)
+    }
+  }, [streamError])
+
+  // Animate confidence based on progress
+  useEffect(() => {
+    const target = Math.min(Math.round(progress * 0.99), 99)
     const step = () => {
       setConfidence((prev) => {
         if (prev >= target) return target
@@ -104,9 +156,9 @@ export function AnalysisPipeline({
     }
     const interval = setInterval(step, 30)
     return () => clearInterval(interval)
-  }, [active])
+  }, [progress])
 
-  // V2 — Cycle through layers
+  // Cycle through layers
   useEffect(() => {
     const t = setInterval(() => {
       setCurrentLayer((l) => (l + 1) % layerNames.length)
@@ -114,12 +166,40 @@ export function AnalysisPipeline({
     return () => clearInterval(t)
   }, [])
 
-  const progress = Math.round((active / (steps.length - 1)) * 100)
+  if (error) {
+    return (
+      <div className="mx-auto flex min-h-screen max-w-4xl flex-col items-center justify-center px-5 pt-28 pb-16">
+        <motion.div
+          initial={{ opacity: 0, y: -20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.8 }}
+          className="mb-6"
+        >
+          <AiCore state="error" size={50} />
+        </motion.div>
+
+        <div className="mb-8 text-center">
+          <span className="font-mono text-xs uppercase tracking-[0.25em] text-red-400">
+            Analysis Error
+          </span>
+          <h1 className="mt-3 font-display text-3xl font-semibold tracking-tight sm:text-4xl">
+            Something went wrong
+          </h1>
+          <div className="mt-6 flex flex-col items-center gap-2 rounded-2xl bg-red-500/10 p-4 border border-red-500/20">
+            <AlertCircle className="h-5 w-5 text-red-400" />
+            <p className="text-sm text-red-400">{error}</p>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   // V2 — Completed steps emit pulse rings
   const completedPulses = useMemo(() => {
-    return Array.from({ length: active }).map((_, i) => i)
+    return Array.from({ length: active + 1 }).map((_, i) => i)
   }, [active])
+
+  const displayProgress = isUploading ? uploadProgress : progress
 
   return (
     <div className="mx-auto flex min-h-screen max-w-4xl flex-col items-center justify-center px-5 pt-28 pb-16">
@@ -144,7 +224,7 @@ export function AnalysisPipeline({
           Analyzing <span className="text-cyan">{fileName}</span>
         </h1>
         <p className="mt-2 font-mono text-sm text-muted-foreground">
-          {progress}% · inference in progress
+          {displayProgress}% · {status?.current_stage || 'starting analysis'}
         </p>
       </div>
 
@@ -152,14 +232,14 @@ export function AnalysisPipeline({
       <div className="relative mb-8 h-1.5 w-full max-w-lg overflow-hidden rounded-full bg-white/8">
         <motion.div
           className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-cyan via-blue to-purple"
-          animate={{ width: `${progress}%` }}
+          animate={{ width: `${displayProgress}%` }}
           transition={{ ease: 'easeOut' }}
           style={{ boxShadow: '0 0 20px rgba(34,211,238,0.7), 0 0 40px rgba(34,211,238,0.3)' }}
         />
         {/* Particle at leading edge */}
         <motion.div
           className="absolute top-1/2 -translate-y-1/2 h-3 w-3 rounded-full bg-white"
-          animate={{ left: `${Math.max(0, progress - 1)}%` }}
+          animate={{ left: `${Math.max(0, displayProgress - 1)}%` }}
           transition={{ ease: 'easeOut' }}
           style={{
             boxShadow: '0 0 12px 4px rgba(34,211,238,1)',

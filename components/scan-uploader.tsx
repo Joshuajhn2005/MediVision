@@ -2,9 +2,11 @@
 
 import { useCallback, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
-import { UploadCloud, ImageIcon, X, ArrowRight, Zap } from 'lucide-react'
+import { UploadCloud, ImageIcon, X, ArrowRight, Zap, AlertCircle } from 'lucide-react'
 import { GlowButton } from '@/components/glow-button'
 import { useCursor } from '@/lib/cursor-context'
+import { validateFile } from '@/lib/api/services/upload'
+import { getAnalysisRoute, validateAnalysisRoute } from '@/lib/modality-routing'
 
 /**
  * V2 — MRI Scanner Chamber Upload Experience.
@@ -17,32 +19,54 @@ import { useCursor } from '@/lib/cursor-context'
  * - Holographic floor grid
  * - Manual modality selector REMOVED — auto-detection in Chamber
  *
- * When a file is dropped → navigates directly to the Radiology Chamber.
+ * When a file is dropped → validates file and modality, then navigates to Radiology Chamber.
+ * Now integrates with API file validation and modality routing.
  */
 
 interface ScanUploaderProps {
-  onScanReady: (fileName: string) => void
+  onScanReady: (fileName: string, file: File) => void
 }
 
 export function ScanUploader({ onScanReady }: ScanUploaderProps) {
   const [dragging, setDragging] = useState(false)
   const [fileName, setFileName] = useState<string | null>(null)
+  const [file, setFile] = useState<File | null>(null)
   const [scannerActive, setScannerActive] = useState(false)
+  const [validationError, setValidationError] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const { setVariant, setLabel } = useCursor()
 
-  const handleFiles = useCallback((files: FileList | null) => {
-    if (files && files[0]) {
-      setFileName(files[0].name)
-      setScannerActive(true)
+  const handleFiles = useCallback(async (files: FileList | null) => {
+    if (!files || !files[0]) return
+
+    const selectedFile = files[0]
+    setValidationError(null)
+
+    // Validate file
+    const validation = await validateFile(selectedFile)
+    if (!validation.valid) {
+      setValidationError(validation.error || 'Invalid file')
+      return
     }
+
+    // Check modality and routing
+    const route = getAnalysisRoute(selectedFile.name)
+    const routeValidation = validateAnalysisRoute(route)
+    if (!routeValidation.valid) {
+      setValidationError(routeValidation.error || 'Unsupported modality')
+      return
+    }
+
+    setFileName(selectedFile.name)
+    setFile(selectedFile)
+    setScannerActive(true)
   }, [])
 
   const handleLaunch = useCallback(() => {
-    if (fileName) {
-      onScanReady(fileName)
+    if (fileName && file) {
+      onScanReady(fileName, file)
     }
-  }, [fileName, onScanReady])
+  }, [fileName, file, onScanReady])
 
   return (
     <div className="mx-auto max-w-4xl px-5 pt-28 pb-20">
@@ -246,7 +270,36 @@ export function ScanUploader({ onScanReady }: ScanUploaderProps) {
         />
 
         <AnimatePresence mode="wait">
-          {fileName ? (
+          {validationError ? (
+            <motion.div
+              key="error"
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0 }}
+              className="relative z-10 flex flex-col items-center"
+            >
+              <div className="relative flex h-20 w-20 items-center justify-center rounded-2xl bg-red-500/15 text-red-400">
+                <AlertCircle className="h-9 w-9" />
+              </div>
+              <p className="mt-4 font-medium text-red-400">Validation Error</p>
+              <p className="mt-2 max-w-xs text-center text-sm text-red-400/80">
+                {validationError}
+              </p>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setFileName(null)
+                  setFile(null)
+                  setScannerActive(false)
+                  setValidationError(null)
+                  inputRef.current?.click()
+                }}
+                className="mt-3 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-cyan transition-colors"
+              >
+                <X className="h-3 w-3" /> Try Again
+              </button>
+            </motion.div>
+          ) : fileName ? (
             <motion.div
               key="loaded"
               initial={{ opacity: 0, scale: 0.9 }}
@@ -261,12 +314,13 @@ export function ScanUploader({ onScanReady }: ScanUploaderProps) {
               <p className="mt-4 font-medium">{fileName}</p>
               <p className="mt-1 text-sm text-muted-foreground">
                 <Zap className="inline h-3.5 w-3.5 text-cyan mr-1" />
-                AI will auto-detect modality
+                Ready for analysis
               </p>
               <button
                 onClick={(e) => {
                   e.stopPropagation()
                   setFileName(null)
+                  setFile(null)
                   setScannerActive(false)
                 }}
                 className="mt-3 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-critical transition-colors"
